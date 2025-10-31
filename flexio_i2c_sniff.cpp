@@ -1,19 +1,17 @@
 #include "flexio_i2c_sniff.h"
 
-void I2C_Sniff::process(void) {
-  if (!ready) return;
-
-  const uint32_t *s = data;
+void I2C_Sniff::decode(const uint32_t *s) {
+  uint32_t len = *s++ - 32;
   uint32_t src = *s++;
-  size_t i = 0;
-  if (pos > 9) {
+  uint32_t i = 0;
+  if (len > 9) {
     Serial.printf("ADDR %02X+%s|%s", src>>25, src&0x01000000 ? "read":"write", src&0x00800000 ? "NACK":"ACK");
     src <<= 9;
     i += 9;
-    pos -= 9;
+    len -= 9;
   }
   // intermediate bytes
-  while (pos > 9) {
+  while (len > 9) {
     uint8_t d;
     if (i <= 24) {
       d = src >> 24;
@@ -27,19 +25,31 @@ void I2C_Sniff::process(void) {
       src <<= i;
     }
     Serial.printf("\t%02X|", d);
-    if (i >= 32) src = *s++;
+    if (i >= 32) src = *s++, i = 0;
     Serial.printf("%s", src&0x80000000 ? "NACK":"ACK");
     src <<= 1;
     ++i;
-    pos -= 9;
+    len -= 9;
   }
 
-  if (pos) {
+  if (len) {
     if (i >= 32) src = *s++;
     Serial.printf("\t%s\n", src & 0x80000000 ? "RESTART":"STOP");
-    pos = 0;
-    data[0] = 0;
   }
+}
+
+void I2C_Sniff::process(void) {
+  if (!ready) return;
+  NVIC_DISABLE_IRQ(IRQ_FLEXIO3);
+
+  const uint32_t* s = data;
+  while (*s) {
+    decode(s);
+    s += (*s + 31) / 32;
+  }
+  memcpy(data, s, sizeof(data) - sizeof(data[0])*(s-data));
+  pos -= 32*(s-data);
+  rec = data;
 
   ready = false;
   NVIC_ENABLE_IRQ(IRQ_FLEXIO3);
@@ -47,27 +57,42 @@ void I2C_Sniff::process(void) {
 
 void I2C_Sniff::add_data(uint32_t src, uint32_t mask, bool finished) {
   if (mask) {
-    size_t lead;
-    size_t i = (pos & 31);
+    uint32_t lead;
+    uint32_t i = (pos & 31);
+    uint32_t j = 32 - i;
     asm volatile("clz %0, %1" : "=r"(lead) : "r"(mask));
-    size_t length = 32 - lead;
+    uint32_t length = 32 - lead;
     src <<= lead;
     
     uint32_t *dst = &data[pos / 32];
-    *dst |= src >> i;
-    if (length > i) {
-      *(++dst) = src << (32 - i);
+//    Serial.printf("pos %d src %08X mask %08X dst %08X\n", pos, src, mask, *dst);
+    if (i) *dst |= src >> i;
+    else *dst = src;
+    if (length > j) {
+      *(++dst) = src << j;
     }
     pos += length;
   }
 
   if (finished) {
-    NVIC_DISABLE_IRQ(IRQ_FLEXIO3);
+    *rec = pos - (rec - data)*32;
+    // move to word boundary for next record
+    pos = (pos + 63) & ~31;
+    rec = data + (pos / 32) - 1;
+    *rec = 0;
+
+    // delay if no more room
+    if (pos >= 126*32)
+      NVIC_DISABLE_IRQ(IRQ_FLEXIO3);
+
     ready = true;
   }
 }
 
 FLASHMEM void I2C_Sniff::begin(void) {
+  rec = data;
+  pos = 32;
+
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_07 = 0x19; // pin 16 = FlexIO3 pin 7 (SCL)
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_06 = 0x19; // pin 17 = FlexIO3 pin 6 (SDA)
   // configure pins for I2C
@@ -110,7 +135,7 @@ FLASHMEM void I2C_Sniff::begin(void) {
 
   // timer 2: enable/disable with previous timer, decrement on SCL
   FLEXIO3_TIMCFG2 = FLEXIO_TIMCFG_TIMDEC(2) | FLEXIO_TIMCFG_TIMDIS(1) | FLEXIO_TIMCFG_TIMENA(1);
-  // receive 32-bits max before storing
+  // can hold up to 32 bits before storing
   FLEXIO3_TIMCMP2 = (32*2)-1;
   // pin = SCL, 16-bit counter
   FLEXIO3_TIMCTL2 = FLEXIO_TIMCTL_PINSEL(7) | FLEXIO_TIMCTL_TIMOD(3);
@@ -171,6 +196,7 @@ void I2C_Sniff::flexISR(void) {
   asm volatile("dsb");
 }
 
-uint32_t I2C_Sniff::data[(257*9 + 1 + 31) / 32] = {0};
-size_t I2C_Sniff::pos = 0;
-bool I2C_Sniff::ready = false;
+uint32_t I2C_Sniff::data[128];
+uint32_t* I2C_Sniff::rec;
+uint32_t I2C_Sniff::pos;
+bool I2C_Sniff::ready;
