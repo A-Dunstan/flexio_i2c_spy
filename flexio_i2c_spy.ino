@@ -46,13 +46,28 @@ void setup() {
 // Stream::parseInt() is dumb and returns 0 (a valid integer) for invalid integers.
 int parseInt(Stream& s) {
   int i = -1;
-  while (s.available() > 0) {
-    int c = s.read();
-    if (c >= '0' && c <= '9') {
-      if (i < 0) i = c - '0';
-      else i = i*10 + c-'0';
+  while (1) {
+    // wait up to 1ms for more input
+    if (!s.available() && (delay(1),!s.available()))
+      break;
+    int c = s.peek();
+    switch (c) {
+      case '0' ... '9':
+        if (i < 0) i = c-'0';
+        else i = i*10 + c-'0';
+        s.read();
+        break;
+      // eat whitespace
+      case ' ':
+      case '\t':
+      case '\r':
+      case '\n':
+        s.read();
+        if (i == -1) break;
+        // fallthrough
+      default:
+        return i;
     }
-    else if (i >= 0) break;
   }
   return i;
 }
